@@ -5,7 +5,8 @@
 Токен — в заголовке Authorization как есть (без слова Bearer).
 
 WB ограничивает частоту запросов. При 429 присылает X-Ratelimit-Retry —
-сколько секунд ждать. Клиент это читает и выжидает.
+сколько секунд ждать. При обрыве связи делаем повторы и НЕ роняем процесс:
+если так и не дозвонились — возвращаем None, вызывающий код это переживёт.
 """
 import time
 import requests
@@ -31,32 +32,36 @@ class WBFeedbacks:
                     pass
         return default
 
+    # Сколько раз пробуем и максимум ожидания при 429 (чтобы не залипать на одном отзыве)
+    MAX_ATTEMPTS = 4
+    WAIT_CAP = 30
+
     def _request(self, method: str, path: str, **kwargs):
+        """Повторяет при 429/5xx/обрыве связи. Возвращает ответ или None.
+        Ожидание ограничено, чтобы один проблемный отзыв не тормозил весь прогон —
+        он просто будет обработан при следующем запуске."""
         url = BASE + path
         last = None
-        for attempt in range(6):
+        for attempt in range(self.MAX_ATTEMPTS):
             try:
-                r = self.s.request(method, url, timeout=60, **kwargs)
+                r = self.s.request(method, url, timeout=40, **kwargs)
             except requests.RequestException:
-                if attempt == 5:
-                    raise
-                time.sleep(5 * (attempt + 1))
+                # обрыв связи и т.п. — ждём и пробуем снова, НЕ падаем
+                time.sleep(min(5 * (attempt + 1), self.WAIT_CAP))
                 continue
             last = r
             if r.status_code == 429:
-                wait = self._retry_after(r, default=15 * (attempt + 1))
-                time.sleep(min(wait, 120))
+                wait = self._retry_after(r, default=10 * (attempt + 1))
+                time.sleep(min(wait, self.WAIT_CAP))
                 continue
             if r.status_code >= 500:
-                time.sleep(5 * (attempt + 1))
+                time.sleep(min(5 * (attempt + 1), self.WAIT_CAP))
                 continue
             return r
-        return last
+        return last  # None, если ни одна попытка не дала ответа
 
     def get_feedbacks(self, is_answered="false", date_from=None, date_to=None,
                       take: int = 5000, order: str = "dateAsc") -> list:
-        """Универсальный список отзывов. is_answered: 'false'/'true'.
-        date_from/date_to — unix-секунды (фильтр по дате создания отзыва)."""
         params = {"isAnswered": is_answered, "take": take, "skip": 0, "order": order}
         if date_from is not None:
             params["dateFrom"] = date_from
@@ -80,10 +85,13 @@ class WBFeedbacks:
         return 0
 
     def answer(self, feedback_id: str, text: str):
-        payload = {"id": feedback_id, "text": text}
-        r = self._request("POST", "/api/v1/feedbacks/answer", json=payload)
+        """Отправляет ответ. Возвращает (успех, описание). Никогда не бросает исключение."""
+        try:
+            r = self._request("POST", "/api/v1/feedbacks/answer", json={"id": feedback_id, "text": text})
+        except Exception as e:
+            return False, f"исключение: {e}"
         if r is None:
-            return False, "нет ответа от WB"
+            return False, "нет ответа от WB (обрыв связи)"
         if r.status_code in (200, 204):
             return True, "ok"
         return False, f"HTTP {r.status_code}: {r.text[:200]}"
